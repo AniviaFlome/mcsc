@@ -1,0 +1,13 @@
+[package]
+name = "mcsc-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+fastnbt = "2"
+flate2 = "1"
+walkdir = "2"
+thiserror = "1"
+chrono = "0.4"

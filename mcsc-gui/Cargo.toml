@@ -1,0 +1,17 @@
+[package]
+name = "mcsc-gui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mcsc"
+path = "src/main.rs"
+
+[dependencies]
+mcsc-core = { path = "../mcsc-core" }
+iced = { version = "0.14", features = ["tokio"] }
+tokio = { version = "1", features = ["rt"] }
+futures = "0.3"
+serde_json = "1"
+ureq = "2"
+rfd = "0.15"
