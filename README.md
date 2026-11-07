@@ -1,6 +1,6 @@
 # mcsc — Minecraft Server World Converter
 
-Iced GUI that converts server worlds between layouts (Paper/Purpur/Spigot/Fabric ↔ Vanilla), with offline→online player remap and a report-only modded-content scan.
+Rune GUI that converts server worlds between layouts (Paper/Purpur/Spigot/Fabric ↔ Vanilla), with offline→online player remap and a report-only modded-content scan.
 
 ![mcsc screenshot](assets/screenshot.png)
 

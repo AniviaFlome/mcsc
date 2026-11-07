@@ -219,7 +219,12 @@ fn byte_scan_ids(bytes: &[u8]) -> Vec<String> {
     let push = |cur: &mut Vec<u8>, out: &mut Vec<String>| {
         if cur.len() >= 4 {
             if let Ok(s) = std::str::from_utf8(cur) {
-                if s.contains(':') && is_plausible_id(s) && !s.starts_with("minecraft:") {
+                if s.contains(':')
+                    && is_plausible_id(s)
+                    && !s.starts_with("minecraft:")
+                    && !s.starts_with("mojang:")
+                    && !s.starts_with("brigadier:")
+                {
                     out.push(s.to_string());
                 }
             }
@@ -270,4 +275,36 @@ pub fn write_report_text(rep: &ScanReport, dest: &Path) -> std::io::Result<()> {
         writeln!(s, "warn: {w}").unwrap();
     }
     std::fs::write(dest, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_scan_agrees_with_fast_path_filters() {
+        // Vanilla plumbing namespaces must never count as modded, whichever
+        // extraction path runs.
+        let bytes =
+            b"\x00minecraft:stone\x00mojang:foo\x00brigadier:bar\x00biomesoplenty:orange_sand\x00";
+        let ids = byte_scan_ids(bytes);
+        assert_eq!(ids, vec!["biomesoplenty:orange_sand".to_string()]);
+        // And the NBT path agrees.
+        let v = fastnbt::Value::Compound(
+            [
+                ("a".to_string(), fastnbt::Value::String("mojang:foo".into())),
+                (
+                    "b".to_string(),
+                    fastnbt::Value::String("biomesoplenty:orange_sand".into()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let raw = fastnbt::to_bytes(&v).unwrap();
+        assert_eq!(
+            extract_ids(&raw),
+            vec!["biomesoplenty:orange_sand".to_string()]
+        );
+    }
 }

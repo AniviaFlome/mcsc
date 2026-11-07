@@ -104,6 +104,7 @@ pub enum ConvertError {
 
 pub fn convert(opts: &ConvertOptions) -> Result<ConvertReport, ConvertError> {
     let mut report = ConvertReport::default();
+    validate_level_name(&opts.level_name)?;
     let root = &opts.server_root;
     let level = root.join(&opts.level_name);
 
@@ -165,13 +166,18 @@ pub fn convert(opts: &ConvertOptions) -> Result<ConvertReport, ConvertError> {
     // here so dry runs preview them too).
     let mut remaps: Vec<(String, String)> = opts.uuid_remap.clone().into_iter().collect();
     if opts.auto_remap_all {
-        let (auto_pairs, unmapped) = discover_auto_pairs(
+        let (auto_pairs, unmapped, lookup_failed) = discover_auto_pairs(
             root,
             &plan_src.join(&opts.level_name),
             opts.uuid_resolver.as_ref(),
             &mut say,
         );
         remaps.extend(auto_pairs);
+        for name in lookup_failed {
+            report.warnings.push(format!(
+                "Known player '{name}' has offline files but the online-UUID lookup failed — remap them manually or retry with internet."
+            ));
+        }
         for uuid in unmapped {
             // Manual pair may still cover it; only warn when truly orphaned.
             let covered = remaps.iter().any(|(f, _)| f == &uuid);
@@ -238,6 +244,28 @@ pub fn convert(opts: &ConvertOptions) -> Result<ConvertReport, ConvertError> {
     Ok(report)
 }
 
+/// Reject level names that would escape the server folder. The name comes
+/// from user input or `server.properties` (which ships inside downloaded
+/// server zips), so `..`, separators and absolute paths must never reach
+/// the filesystem joins below — in-place mode mutates whatever they point
+/// at. Plain names with spaces etc. are fine.
+fn validate_level_name(level_name: &str) -> Result<(), ConvertError> {
+    let bad = level_name.is_empty()
+        || level_name == "."
+        || level_name == ".."
+        || level_name.contains('/')
+        || level_name.contains('\\')
+        || level_name.contains('\0')
+        || Path::new(level_name).is_absolute()
+        || level_name.split(['/', '\\']).any(|c| c == ".." || c == ".");
+    if bad {
+        return Err(ConvertError::NothingToDo(format!(
+            "refusing level name {level_name:?}: must be a plain folder name, not a path"
+        )));
+    }
+    Ok(())
+}
+
 /// Discover (offline_uuid, online_uuid) pairs automatically, without typing:
 /// every username known to the server (usercache.json, ops.json,
 /// whitelist.json, banned-players.json) whose offline player file exists is
@@ -252,7 +280,7 @@ fn discover_auto_pairs(
     plan_level: &Path,
     resolver: Option<&UuidResolver>,
     say: &mut dyn FnMut(String),
-) -> (Vec<(String, String)>, Vec<String>) {
+) -> (Vec<(String, String)>, Vec<String>, Vec<String>) {
     // Offline player files actually present (vanilla + Paper layouts).
     let mut present = std::collections::HashSet::new();
     for dir in [
@@ -271,7 +299,7 @@ fn discover_auto_pairs(
         }
     }
     if present.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     // Group known UUIDs per username across all local identity sources.
     let mut by_name: std::collections::BTreeMap<String, Vec<String>> =
@@ -283,6 +311,7 @@ fn discover_auto_pairs(
     }
     let mut pairs = Vec::new();
     let mut covered = std::collections::HashSet::new();
+    let mut lookup_failed: Vec<String> = Vec::new();
     for (name, uuids) in &by_name {
         let offline = offline_uuid(name);
         if !present.contains(&offline) {
@@ -300,6 +329,7 @@ fn discover_auto_pairs(
         }
         // Otherwise fall back to the online lookup.
         let Some(resolver) = resolver else {
+            lookup_failed.push(name.clone());
             continue;
         };
         say(format!("Looking up online UUID for {name}…"));
@@ -308,13 +338,18 @@ fn discover_auto_pairs(
                 pairs.push((offline.clone(), online));
                 covered.insert(offline);
             }
-            _ => say(format!("No online UUID found for {name} — skipped.")),
+            _ => {
+                say(format!("No online UUID found for {name} — skipped."));
+                lookup_failed.push(name.clone());
+            }
         }
     }
     // Offline files nobody claims: name them so the user can identify them.
     let mut unmapped: Vec<String> = present.difference(&covered).cloned().collect();
     unmapped.sort();
-    (pairs, unmapped)
+    lookup_failed.sort();
+    lookup_failed.dedup();
+    (pairs, unmapped, lookup_failed)
 }
 
 /// Result of converting several worlds in one run.
@@ -326,11 +361,10 @@ pub struct ConvertManyReport {
 }
 
 impl ConvertManyReport {
+    /// Worlds that converted cleanly, including already-clean no-ops
+    /// (`Ok` with nothing to apply). Only `Err` entries count as failed.
     pub fn succeeded(&self) -> usize {
-        self.per_world
-            .iter()
-            .filter(|(_, r)| matches!(r, Ok(rep) if rep.applied))
-            .count()
+        self.per_world.iter().filter(|(_, r)| r.is_ok()).count()
     }
 
     pub fn failed(&self) -> usize {
@@ -401,7 +435,7 @@ fn copy_world_set(
     report: &mut ConvertReport,
     say: &mut dyn FnMut(String),
 ) -> Result<(), ConvertError> {
-    if out.exists() {
+    if out.exists() || out.is_symlink() {
         if opts.dry_run {
             // Preview only: nothing to remove yet.
         } else {
@@ -411,7 +445,11 @@ fn copy_world_set(
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default()
             ));
-            fs::remove_dir_all(out)?;
+            if out.is_dir() && !out.is_symlink() {
+                fs::remove_dir_all(out)?;
+            } else {
+                fs::remove_file(out)?;
+            }
             report.actions.push(ConvertAction {
                 describe: format!("Remove previous output {}", out.display()),
                 from: None,
@@ -476,14 +514,29 @@ fn copy_world_set(
 }
 
 fn count_files(path: &Path) -> u64 {
-    if path.is_file() {
+    if path.is_file() || path.is_symlink() {
         return 1;
     }
     walkdir::WalkDir::new(path)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_type().is_file() || e.file_type().is_symlink() || e.path().is_symlink())
         .count() as u64
+}
+
+/// Recreate a symlink at `to` pointing at the same target as `from`.
+/// Falls back to copying content where links are unsupported.
+fn copy_link(from: &Path, to: &Path) -> std::io::Result<()> {
+    let target = fs::read_link(from)?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, to)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = to;
+        fs::copy(from, to).map(|_| ())
+    }
 }
 
 fn copy_with_progress(
@@ -507,7 +560,10 @@ fn copy_with_progress(
     for entry in entries {
         let ty = entry.file_type()?;
         let to = dst.join(entry.file_name());
-        if ty.is_dir() {
+        if ty.is_symlink() {
+            copy_link(&entry.path(), &to)?;
+            *done += 1;
+        } else if ty.is_dir() {
             copy_dir_progress(&entry.path(), &to, done, total, progress)?;
         } else if ty.is_file() {
             fs::copy(entry.path(), &to)?;
@@ -584,10 +640,49 @@ fn maybe_backup(
     Ok(())
 }
 
+/// Walk a store dir exactly the way [`merge_store_dir`] will, failing on the
+/// first destination conflict when overwrites are off. Running this before
+/// moving anything keeps in-place conversions all-or-nothing per store dir.
+fn preflight_store_dir(
+    src: &Path,
+    dst: &Path,
+    opts: &ConvertOptions,
+    plan_src: &Path,
+) -> Result<(), ConvertError> {
+    let mut entries: Vec<_> = fs::read_dir(src)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    if entries.is_empty() {
+        return Ok(());
+    }
+    entries.sort();
+    for src_path in entries {
+        let name = src_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if src_path.is_dir() && !src_path.is_symlink() {
+            preflight_store_dir(&src_path, &dst.join(&name), opts, plan_src)?;
+            continue;
+        }
+        // Files and symlinks (including links to dirs, which move as links).
+        let dst_path = dst.join(&name);
+        if dst_conflicts(&dst_path, opts, plan_src) && !opts.overwrite {
+            return Err(ConvertError::Exists(dst_path.display().to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// Move the *contents* of one store dir (region/entities/poi) into another,
 /// merging file by file so a partially-present destination survives.
 /// Removes the emptied source dir on real runs. Returns true if anything
 /// was planned (also true for dry runs).
+///
+/// All destination conflicts are checked up front so an in-place run either
+/// moves everything or fails before moving anything — never a half-migrated
+/// world split across two layouts.
 fn merge_store_dir(
     src: &Path,
     dst: &Path,
@@ -600,6 +695,7 @@ fn merge_store_dir(
     if !src.is_dir() {
         return Ok(false);
     }
+    preflight_store_dir(src, dst, opts, plan_src)?;
     let mut entries: Vec<_> = fs::read_dir(src)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -615,7 +711,7 @@ fn merge_store_dir(
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        if src_path.is_dir() {
+        if src_path.is_dir() && !src_path.is_symlink() {
             // Recurse for unexpected nesting.
             let sub_dst = dst.join(&name);
             if merge_store_dir(&src_path, &sub_dst, opts, report, say, &name, plan_src)? {
@@ -794,7 +890,9 @@ fn move_or_copy_dir(
     say: &mut dyn FnMut(String),
     plan_src: &Path,
 ) -> Result<(), ConvertError> {
-    if !src.exists() {
+    // `exists()` follows links, so check the link itself too — a dangling
+    // symlink is still something to move.
+    if !src.exists() && !src.is_symlink() {
         return Ok(());
     }
     say(format!("Moving {what}…"));
@@ -835,7 +933,9 @@ fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let entry = entry?;
         let ty = entry.file_type()?;
         let to = dst.join(entry.file_name());
-        if ty.is_dir() {
+        if ty.is_symlink() {
+            copy_link(&entry.path(), &to)?;
+        } else if ty.is_dir() {
             copy_recursive(&entry.path(), &to)?;
         } else {
             fs::copy(entry.path(), &to)?;
@@ -2392,5 +2492,159 @@ mod tests {
         // Nothing was created anywhere.
         assert!(!root.join("world-converted-vanilla26").exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn level_name_path_traversal_is_refused() {
+        let root = std::env::temp_dir().join(format!("mcsc-convtrav-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("srv")).unwrap();
+        fs::create_dir_all(root.join("evil")).unwrap();
+        fs::write(root.join("evil/level.dat"), b"x").unwrap();
+        for bad in ["../evil", "a/b", "..", "", ".", "C:\\evil", "/absolute"] {
+            let opts = ConvertOptions {
+                server_root: root.join("srv"),
+                level_name: bad.into(),
+                target: TargetLayout::Vanilla,
+                backup: false,
+                dry_run: true,
+                overwrite: false,
+                progress: None,
+                in_place: true,
+                uuid_remap: None,
+                auto_remap_all: false,
+                uuid_resolver: None,
+                output_dir: None,
+            };
+            let err = convert(&opts).unwrap_err().to_string();
+            assert!(
+                err.contains("plain folder name"),
+                "level {bad:?} must be refused, got: {err}"
+            );
+        }
+        // The outside dir was never touched.
+        assert!(root.join("evil/level.dat").is_file());
+        assert!(!root.join("evil").join("DIM-1").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copy_mode_preserves_symlinks() {
+        let root = std::env::temp_dir().join(format!("mcsc-convlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("srv/world/region")).unwrap();
+        fs::write(root.join("srv/world/level.dat"), b"x").unwrap();
+        fs::write(root.join("srv/world/region/r.0.0.mca"), b"c").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("r.0.0.mca", root.join("srv/world/region/link.mca")).unwrap();
+        let opts = ConvertOptions {
+            server_root: root.join("srv"),
+            level_name: "world".into(),
+            target: TargetLayout::Vanilla,
+            backup: false,
+            dry_run: false,
+            overwrite: false,
+            progress: None,
+            in_place: false,
+            uuid_remap: None,
+            auto_remap_all: false,
+            uuid_resolver: None,
+            output_dir: None,
+        };
+        let rep = convert(&opts).unwrap();
+        let out = rep.output_root.clone().unwrap();
+        assert!(out.join("world/region/r.0.0.mca").is_file());
+        #[cfg(unix)]
+        {
+            let link = out.join("world/region/link.mca");
+            assert_eq!(
+                std::fs::read_link(&link).unwrap().to_string_lossy(),
+                "r.0.0.mca"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merge_conflict_moves_nothing_first() {
+        // In-place Paper->Vanilla where the second file collides: the first
+        // file must still be in place (all-or-nothing per store dir).
+        let root = std::env::temp_dir().join(format!("mcsc-convatomic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let base = root.join("srv/world/dimensions/minecraft");
+        fs::create_dir_all(base.join("overworld/region")).unwrap();
+        fs::write(base.join("overworld/region/a.mca"), b"A-new").unwrap();
+        fs::write(base.join("overworld/region/b.mca"), b"B-new").unwrap();
+        fs::create_dir_all(root.join("srv/world/region")).unwrap();
+        fs::write(root.join("srv/world/region/b.mca"), b"B-old").unwrap();
+        fs::write(root.join("srv/world/level.dat"), b"x").unwrap();
+        let opts = ConvertOptions {
+            server_root: root.join("srv"),
+            level_name: "world".into(),
+            target: TargetLayout::Vanilla,
+            backup: false,
+            dry_run: false,
+            overwrite: false,
+            progress: None,
+            in_place: true,
+            uuid_remap: None,
+            auto_remap_all: false,
+            uuid_resolver: None,
+            output_dir: None,
+        };
+        assert!(convert(&opts).is_err());
+        assert!(
+            base.join("overworld/region/a.mca").is_file(),
+            "a.mca must not have moved before the conflict"
+        );
+        assert!(
+            !root.join("srv/world/region/a.mca").exists(),
+            "destination must not hold a half-migrated file"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_lookup_names_the_known_player() {
+        let root = std::env::temp_dir().join(format!("mcsc-convlookup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let off = crate::players::offline_uuid("GhostNoFile");
+        fs::create_dir_all(root.join("srv/world/players/data")).unwrap();
+        fs::write(
+            root.join("srv/world/players/data")
+                .join(format!("{off}.dat")),
+            b"p",
+        )
+        .unwrap();
+        fs::write(root.join("srv/world/level.dat"), b"x").unwrap();
+        fs::write(
+            root.join("srv/usercache.json"),
+            r#"[{"name":"GhostNoFile","uuid":"00000000-0000-3000-8000-000000000000"}]"#,
+        )
+        .unwrap();
+        let mut opts = base_opts(&root.join("srv"), TargetLayout::Vanilla);
+        opts.auto_remap_all = true;
+        opts.uuid_resolver = Some(crate::players::UuidResolver::new(|_: &str| None));
+        let rep = convert(&opts).unwrap();
+        assert!(
+            rep.warnings
+                .iter()
+                .any(|w| w.contains("GhostNoFile") && w.contains("lookup failed")),
+            "must blame the failed lookup, got: {:?}",
+            rep.warnings
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn many_counts_noop_ok_as_succeeded() {
+        let rep = ConvertManyReport {
+            per_world: vec![
+                ("w1".to_string(), Ok(ConvertReport::default())),
+                ("w2".to_string(), Err("boom".to_string())),
+            ],
+        };
+        assert_eq!(rep.succeeded(), 1);
+        assert_eq!(rep.failed(), 1);
     }
 }
